@@ -1,0 +1,129 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import prisma from "@/lib/prisma";
+import { z } from "zod";
+
+const questionOptionSchema = z.object({
+  content: z.string().min(1),
+  isCorrect: z.boolean(),
+});
+
+const questionSchema = z.object({
+  content: z.string().min(1, "Nội dung câu hỏi là bắt buộc"),
+  audioUrl: z.string().optional(),
+  imageUrl: z.string().optional(),
+  correctText: z.string().optional(),
+  sampleAudio: z.string().optional(),
+  options: z.array(questionOptionSchema).optional(),
+});
+
+const attachmentSchema = z.object({
+  url: z.string(),
+  fileName: z.string(),
+  fileType: z.string(),
+});
+
+const createAssignmentSchema = z.object({
+  title: z.string().min(1, "Tiêu đề là bắt buộc"),
+  description: z.string().optional(),
+  type: z.enum(["MCQ", "ESSAY", "PRONUNCIATION", "TRANSLATION_SPEAKING", "TF_ON_DOCUMENT"]),
+  classroomId: z.string().min(1, "Lớp học là bắt buộc"),
+  deadline: z.string().optional(),
+  questions: z.array(questionSchema).optional(),
+  attachments: z.array(attachmentSchema).optional(),
+});
+
+// POST - Tạo bài tập mới
+export async function POST(request: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions);
+    if (!session?.user) {
+      return NextResponse.json({ error: "Chưa đăng nhập" }, { status: 401 });
+    }
+
+    if (!["ADMIN", "TEACHER"].includes(session.user.role)) {
+      return NextResponse.json({ error: "Không có quyền" }, { status: 403 });
+    }
+
+    const body = await request.json();
+    const result = createAssignmentSchema.safeParse(body);
+
+    if (!result.success) {
+      return NextResponse.json(
+        { error: result.error.issues[0].message },
+        { status: 400 }
+      );
+    }
+
+    const { classroomId, questions, deadline, attachments, ...assignmentData } = result.data;
+
+    // Kiểm tra quyền với lớp học
+    const classroom = await prisma.classroom.findUnique({
+      where: { id: classroomId },
+    });
+
+    if (!classroom) {
+      return NextResponse.json({ error: "Không tìm thấy lớp" }, { status: 404 });
+    }
+
+    if (classroom.teacherId !== session.user.id && session.user.role !== "ADMIN") {
+      return NextResponse.json({ error: "Không có quyền với lớp này" }, { status: 403 });
+    }
+
+    // Tạo bài tập với câu hỏi và attachments
+    const assignment = await prisma.assignment.create({
+      data: {
+        ...assignmentData,
+        classroomId,
+        createdById: session.user.id,
+        deadline: deadline ? new Date(deadline) : null,
+        questions: questions
+          ? {
+              create: questions.map((q, index) => ({
+                content: q.content,
+                audioUrl: q.audioUrl,
+                imageUrl: q.imageUrl,
+                correctText: q.correctText,
+                sampleAudio: q.sampleAudio,
+                orderIndex: index,
+                options: q.options
+                  ? {
+                      create: q.options.map((opt, optIndex) => ({
+                        content: opt.content,
+                        isCorrect: opt.isCorrect,
+                        orderIndex: optIndex,
+                      })),
+                    }
+                  : undefined,
+              })),
+            }
+          : undefined,
+        attachments: attachments && attachments.length > 0
+          ? {
+              create: attachments.map((att) => ({
+                fileName: att.fileName,
+                fileUrl: att.url,
+                fileType: att.fileType,
+              })),
+            }
+          : undefined,
+      },
+      include: {
+        questions: {
+          include: { options: true },
+          orderBy: { orderIndex: "asc" },
+        },
+        attachments: true,
+      },
+    });
+
+    return NextResponse.json(
+      { message: "Tạo bài tập thành công", assignment },
+      { status: 201 }
+    );
+  } catch (error) {
+    console.error("Create assignment error:", error);
+    return NextResponse.json({ error: "Lỗi server" }, { status: 500 });
+  }
+}
